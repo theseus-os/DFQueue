@@ -9,21 +9,22 @@
 //! Each producer retains ownership of the data items it queues, and only those items. 
 //! Thus, a producer is responsible for removing its items from the queue once they have been marked complete by the consumer. 
 
-#![feature(alloc, collections)]
-#![allow(dead_code)]
+// #![no_std]
 
-// #![no_std] // use core instead of std
+#![allow(dead_code)]
+#![feature(alloc, collections)]
+
+extern crate core;
 
 extern crate spin;
 extern crate alloc;
 extern crate collections;
 
 use spin::{Mutex, MutexGuard};
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::arc::Arc;
 use collections::VecDeque;
 
-// use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 
 /// These two types indicate that only immutable items can be queued right now. 
@@ -56,6 +57,12 @@ impl<T> QueuedData<T> {
         self.completed.store(true, Ordering::SeqCst);
     }
 
+    /// Whether this item has been completed (handled) by the DFQueueConsumer.
+    /// If an item is completed, the producer knows it's okay to remove it from the queue.
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::SeqCst)
+    }
+
     // /// returns true if the given `QueuedData` was locked
     // fn is_locked(&self) -> bool {
     //     match self.data.try_lock() {
@@ -65,111 +72,88 @@ impl<T> QueuedData<T> {
     // }
 }
 
+/// taken from Rust's VecDeque implementation
+const INITIAL_CAPACITY: usize = 7; // 2^3 - 1
 
-/// The actual queue structure. The DFQueueRef is a reference to this actual queue. 
-/// The user should use the DFQueueRef type, not this one. 
-struct DFQueue<T> {
+
+/// The actual queue, an opaque type that cannot be used directly. 
+/// The user must use `DFQueueConsumer` and `DFQueueProducer`. 
+#[derive(Debug)]
+pub struct DFQueue<T> {
+    /// the actual inner queue
     queue: Mutex<VecDeque<QueuedDataType<T>>>,
+    /// whether this queue has a consumer (it can only have one!!)
+    has_consumer: AtomicBool,
 }
 
+impl<T> DFQueue<T> {
 
-/// There is one DFQueueRef per producer and one per consumer.
-/// Do not wrap this in an Arc or Mutex, the queue it is already protected by those on the interior. 
-///
-/// Note: this does not provide a `pop()` method like most queues, 
-/// because we do not permit the consumer to remove items from the queue.
-/// Instead, we require that an element can only be removed from the queue by the producer who originally enqueued it. 
-pub struct DFQueueRef<T> {
-    qref: Arc<DFQueue<T>>,
-    local_backlog: VecDeque<QueuedDataType<T>>,
-}
+    /// Creates a new DFQueue. 
+    ///
+    /// This object cannot be used directly, you must obtain a producer or consumer to the queue
+    /// using the functions `into_consumer()` or `obtain_producer()`.
+    pub fn new() -> DFQueue<T> {
+        DFQueue::with_capacity(INITIAL_CAPACITY)
+    }
 
-
-
-
-impl<T> DFQueueRef<T> {
-
-    /// creates a new DFQueue with the given initial_capacity 
-    /// and returns a shared Arc reference (the first one) to the new queue. 
-    /// TODO: differentiate between a DFQueueRef consumer and producer!!
-    pub fn new_queue(initial_capacity: usize) -> DFQueueRef<T> {
-        DFQueueRef {
-            qref: Arc::new( 
-                DFQueue {
-                    queue: Mutex::new(VecDeque::with_capacity(initial_capacity)),
-                }
-            ),
-            local_backlog: VecDeque::new(),
+    /// Creates a new DFQueue with the given initial_capacity. 
+    ///
+    /// This object cannot be used directly, you must obtain a producer or consumer to the queue
+    /// using the functions `into_consumer()` or `obtain_producer()`.
+    pub fn with_capacity(initial_capacity: usize) -> DFQueue<T> {
+        DFQueue {
+            queue: Mutex::new(VecDeque::with_capacity(initial_capacity)),
+            has_consumer: AtomicBool::new(false),
         }
     }
 
-    /// Call this to obtain another reference to the DFQueue. 
-    /// There should be one reference per consumer and one refernce per producer.
-    /// DFQueueRef does not implement the standard Clone trait, to avoid accidentally cloning it implicity. 
-    /// Do not create multiple cloned `DFQueueRef`s for a single producer or consumer entity. 
-    pub fn obtain_clone(&self) -> DFQueueRef<T> {
-        DFQueueRef {
+    /// Consumes the DFQueue and returns the one and only consumer for this DFQueue. 
+    /// It consumes the DFQueue instance because there is only one consumer allowed per DFQueue.
+    pub fn into_consumer(self) -> DFQueueConsumer<T> {
+        debug_assert!(self.has_consumer.load(Ordering::SeqCst), "DFQueue::into_consumer(): WTF? already had a consumer!");
+        self.has_consumer.store(true, Ordering::SeqCst);
+
+        DFQueueConsumer {
+            qref: Arc::new(self),
+        }
+    }
+
+    /// Consumes the DFQueue and returns a producer. 
+    /// To obtain another DFQueueProducer for this DFQueue, call `obtain_producer()` on the returned DFQueueProducer. 
+    /// DFQueueProducer does not implement the standard Clone trait, to avoid accidentally cloning it implicity. 
+    pub fn into_producer(self) -> DFQueueProducer<T> {
+        DFQueueProducer {
+            qref: Arc::new(self),
+            local_backlog: VecDeque::new(), // TODO: may need to wrap this in an Rc<>
+        }
+    }
+
+}
+
+
+/// A consumer that can process (peek into) elements in a DFQueue, but not actually remove them.
+/// Do not wrap this in an Arc or Mutex, the queue it is already protected by those on the interior. 
+///
+/// This does not provide a `pop()` method like most queues, 
+/// because we do not permit the consumer to remove items from the queue.
+/// Instead, we require that an element can only be removed from the queue by the producer who originally enqueued it. 
+#[derive(Debug)]
+pub struct DFQueueConsumer<T> {
+    qref: Arc<DFQueue<T>>,
+}
+
+impl<T> DFQueueConsumer<T> {
+
+    /// obtains a DFQueueProducer from this consumer instance, since there can be multiple producers.
+    pub fn obtain_producer(&self) -> DFQueueProducer<T> {
+        DFQueueProducer {
             qref: self.qref.clone(),
             local_backlog: VecDeque::new(), // TODO: may need to wrap this in an Rc<>
         }
     }
 
-
-
-   
-
-    /// pushes the given `QueuedData`, which is an Arc reference wrapping the actual data item, onto the queue.
-    /// This is a blocking call that will acquire the queue lock, write the data, 
-    /// and release the lock before returning to the caller. 
-    ///
-    /// Note: this is NOT IRQ-safe. 
-    pub fn enqueue_locking(&mut self, dataref: EnqueueParam<T>) {
-
-        // acquire the lock so we have exclusive access to the inner queue
-        let mut innerq = self.qref.queue.lock(); // blocking call
-
-        // 1) move all the previously-backlogged data into the inner queue
-        // 2) push the actual `dataref` onto the queue
-        innerq.append(&mut self.local_backlog);
-        innerq.push_back(Arc::new(QueuedData::new(dataref.clone()))); 
-
-    }
-
-
-    /// pushes the given `QueuedData`, which is an Arc reference wrapping the actual data item,
-    /// onto the back of the queue, only if the queue lock can be acquired immediately.
-    /// If the queue lock cannot be acquired, then the given `QueuedData` is put on a local backlog queue 
-    /// that is specific to this `DFQueueRef`, which will be merged into the actual inner queue
-    /// on the next invocation of any `enqueue` method, provided that the inner queue can be locked immediately at that point. 
-    /// Returns true if the given `dataref` was added to the inner queue directly, false if it was added to the backlog.
-    ///
-    /// Note: this is IRQ-safe. 
-    pub fn enqueue_lockless(&mut self, dataref: EnqueueParam<T>) -> bool {
-
-
-
-        // first, try to acquire the queue lock. 
-        match self.qref.queue.try_lock() {
-            Some(mut innerq) => {
-
-                // 1) move all the previously-backlogged data into the inner queue
-                // 2) push the actual `dataref` onto the queue
-                innerq.append(&mut self.local_backlog);
-                innerq.push_back(Arc::new(QueuedData::new(dataref.clone()))); 
-                true
-            },
-            None => {
-                // if we can NOT acquire it:
-                // add the given `dataref` to this DFQueueRef's producer-local backlog queue
-                self.local_backlog.push_back(Arc::new(QueuedData::new(dataref.clone())));
-                false
-            }
-        }
-
-    }
-
-
-    /// internal function that returns the first non-completed item in the queue
+    
+    /// internal function that returns the first non-completed item in the queue (queue is locked already)
     fn peek_locked(&self, locked_queue: MutexGuard<VecDeque<QueuedDataType<T>>>) -> Option<QueuedDataType<T>> {
         for e in locked_queue.iter() {
             if e.completed.load(Ordering::SeqCst) {
@@ -221,6 +205,98 @@ impl<T> DFQueueRef<T> {
     }
 
 
+}
+
+
+/// A producer that can enqueue elements into a DFQueue.
+/// Do not wrap this in an Arc or Mutex, the queue it is already protected by those on the interior. 
+#[derive(Debug)]
+pub struct DFQueueProducer<T> {
+    qref: Arc<DFQueue<T>>,
+    local_backlog: VecDeque<QueuedDataType<T>>,
+}
+
+
+impl<T> DFQueueProducer<T> {
+
+    /// Call this to obtain another DFQueueProducer. 
+    /// DFQueueProducer does not implement the standard Clone trait, to avoid accidentally cloning it implicity. 
+    pub fn obtain_producer(&self) -> DFQueueProducer<T> {
+        DFQueueProducer {
+            qref: self.qref.clone(),
+            local_backlog: VecDeque::new(), // TODO: may need to wrap this in an Rc<>
+        }
+    }
+
+
+    /// Returns a DFQueueConsumer for this queue, if it hasn't yet been obtained 
+    /// (either via this function or via `DFQueue::into_consumer()`).
+    /// To ensure there is only a single DFQueueConsumer, it will return `None` if there is already a `DFQueueConsumer`.
+    pub fn get_consumer(&self) -> Option<DFQueueConsumer<T>> {
+        let has_consumer: bool = self.qref.has_consumer.load(Ordering::SeqCst);
+        match has_consumer {
+            true => None,
+            false => {
+                self.qref.has_consumer.store(true, Ordering::SeqCst);
+                Some(
+                    DFQueueConsumer {
+                        qref: self.qref.clone(),
+                    }
+                )
+            }
+        }
+    }
+
+
+    /// pushes the given `QueuedData`, which is an Arc reference wrapping the actual data item, onto the queue.
+    /// This is a blocking call that will acquire the queue lock, write the data, 
+    /// and release the lock before returning to the caller. 
+    ///
+    /// Note: this is NOT IRQ-safe. 
+    pub fn enqueue_locking(&mut self, dataref: EnqueueParam<T>) {
+
+        // acquire the lock so we have exclusive access to the inner queue
+        let mut innerq = self.qref.queue.lock(); // blocking call
+
+        // 1) move all the previously-backlogged data into the inner queue
+        // 2) push the actual `dataref` onto the queue
+        innerq.append(&mut self.local_backlog);
+        innerq.push_back(Arc::new(QueuedData::new(dataref.clone()))); 
+
+    }
+
+
+    /// pushes the given `QueuedData`, which is an Arc reference wrapping the actual data item,
+    /// onto the back of the queue, only if the queue lock can be acquired immediately.
+    /// If the queue lock cannot be acquired, then the given `QueuedData` is put on a local backlog queue 
+    /// that is specific to this `DFQueueRef`, which will be merged into the actual inner queue
+    /// on the next invocation of any `enqueue` method, provided that the inner queue can be locked immediately at that point. 
+    /// Returns true if the given `dataref` was added to the inner queue directly, false if it was added to the backlog.
+    ///
+    /// Note: this is IRQ-safe. 
+    pub fn enqueue_lockless(&mut self, dataref: EnqueueParam<T>) -> bool {
+
+
+
+        // first, try to acquire the queue lock. 
+        match self.qref.queue.try_lock() {
+            Some(mut innerq) => {
+
+                // 1) move all the previously-backlogged data into the inner queue
+                // 2) push the actual `dataref` onto the queue
+                innerq.append(&mut self.local_backlog);
+                innerq.push_back(Arc::new(QueuedData::new(dataref.clone()))); 
+                true
+            },
+            None => {
+                // if we can NOT acquire it:
+                // add the given `dataref` to this DFQueueRef's producer-local backlog queue
+                self.local_backlog.push_back(Arc::new(QueuedData::new(dataref.clone())));
+                false
+            }
+        }
+
+    }
 
 }
 
@@ -233,19 +309,32 @@ impl<T> DFQueueRef<T> {
 #[cfg(test)]
 mod test {
     
+    extern crate std;
+
     use std::thread; 
     use super::*;
+
+
 
     #[test]
     // #[should_panic]
     fn simple_test() {
 
+        let queue: DFQueue<usize> = DFQueue::new();
 
-        let mut queue_prod: DFQueueRef<usize> = DFQueueRef::new_queue(8);
+        let mut queue_prod = queue.into_producer();
+        let mut queue_cons = queue_prod.get_consumer();
+        assert!(queue_cons.is_some(), "First DFQueueConsumer was None!!!");
 
-        let mut queue_cons = queue_prod.obtain_clone();
+        // a second call to get_consumer must return None
+        assert!(queue_prod.get_consumer().is_none(), "Second DFQueueConsumer wasn't None!!"); 
 
-        thread::spawn( move || {
+        let queue_cons = queue_cons.unwrap();
+
+        let mut queue_prod2 = queue_prod.obtain_producer();
+
+
+        let mut thr_p = thread::spawn( move || {
             let original_data: Vec<Arc<usize>> = vec![Arc::new(1), Arc::new(2), Arc::new(3), Arc::new(4), Arc::new(5)];
 
             for i in 1..20 {
@@ -256,21 +345,33 @@ mod test {
                 let queued_data: Arc<usize> = Arc::new(255);
                 queue_prod.enqueue_lockless(queued_data);
             }
+        } );
 
-            loop { }
-        });
+         let mut thr_p2 = thread::spawn( move || {
+            let original_data: Vec<Arc<usize>> = vec![Arc::new(10), Arc::new(11), Arc::new(12), Arc::new(13), Arc::new(14)];
 
-        thread::spawn( move || {
-            while true {
+            for i in 1..20 {
+                for elem in original_data.iter() {
+                    queue_prod2.enqueue_lockless(elem.clone());
+                }
+
+                let queued_data: Arc<usize> = Arc::new(512);
+                queue_prod2.enqueue_lockless(queued_data);
+            }
+        } );
+
+        let mut thr_c = thread::spawn( move || {
+            loop {
                 let mut val = queue_cons.peek_locking();
                 if let Some(v) = val {
                     println!("peeked: {:?}", v);
                     v.mark_completed();
                 }
-
             }
-        });
+        } );
 
-        loop { }
+        thr_p.join();
+        thr_p2.join();
+        thr_c.join();
     }
 }

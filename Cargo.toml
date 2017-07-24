@@ -2,11 +2,11 @@
 authors = ["Kevin Boos <kevinaboos@gmail.com>"]
 name = "dfqueue"
 version = "0.1.0"
-keywords = ["queue", "fault tolerant", "decoupled"]
+keywords = ["queue", "fault tolerant", "decoupled", "interrupt", "irq-safe"]
 categories = ["no-std", "abstractions"]
 license = "MIT"
 
 [dependencies]
-spin = "0.4.5"
 atomic = "0.3.4"
+spin = "0.4.5"
 
