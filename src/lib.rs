@@ -2,12 +2,16 @@
 //! DFQ is compatible with `no_std` and is optionally interrupt-safe by being "temporarily lockless".
 //!
 //! DFQ accepts immutable data items only and does not allow the consumer
-//! to remove (pop) or modify the items in the queue.
-//! Instead, the consumer can call `mark_completed()` on a queued item
-//! to indicate to the producer that the item is ready to be removed from the queue.  
+//! to immediately remove (pop) or modify the items in the queue.
+//! In a transactional fashion, the consumer must call [`mark_completed`]: #method.mark_completed 
+//! on a queued item to indicate that that item can be safely removed from the queue. 
+//! Because the original producer that enqueued that item retains a reference to that item,
+//! it is then safe for any entity (any producer or the consumer) to remove it from the queue. 
 //!
 //! Each producer retains ownership of the data items it queues, and only those items. 
-//! Thus, a producer is responsible for removing its items from the queue once they have been marked complete by the consumer. 
+//! Thus, a producer is able to query the status of that item's handling by the consumer, 
+//! to see if it is still on the queue or if something has gone wrong and it has failed. 
+//! If a failure has occurred, that producer can enqueue that item again. 
 
 // #![no_std]
 
@@ -26,6 +30,30 @@ use core::ops::Deref;
 use alloc::arc::Arc;
 use collections::VecDeque;
 
+
+/// Defines the policy for removing completed items on the queue for a given function call. 
+/// If nothing is specified, the default for a `_locking` function is `RemoveNow`, 
+/// while the default for a `_lockless` function is `NoRemoval`.
+pub enum RemovalPolicy {
+    
+    /// Ensures that this call will NOT perform any removal of completed items.
+    /// Good for ensuring fastest execution. 
+    NoRemoval,
+
+    /// Asks this call to attempt to remove all completed items right now. 
+    /// Of course, if the inner queue cannot be locked, then no elements will be removed.
+    RemoveNow,
+
+    // /// Attempts to remove completed items every `N` invocations of this call, 
+    // /// in which `N` is the given period. 
+    // Periodic(usize),
+}
+
+
+fn remove_completed_items<T>(locked_queue: &mut MutexGuard<VecDeque<QueuedData<T>>>) {
+    // retain elements that are not completed
+    locked_queue.retain(|x| !x.is_completed());
+}
 
 
 
@@ -202,7 +230,7 @@ impl<T> DFQueue<T> {
     pub fn into_producer(self) -> DFQueueProducer<T> {
         DFQueueProducer {
             qref: Arc::new(self),
-            local_backlog: VecDeque::new(), // TODO: may need to wrap this in an Rc<>
+            local_backlog: VecDeque::new(),
         }
     }
 
@@ -222,7 +250,7 @@ pub struct DFQueueConsumer<T> {
 
 impl<T> DFQueueConsumer<T> {
 
-    /// obtains a DFQueueProducer from this consumer instance, since there can be multiple producers.
+    /// Returns a new DFQueueProducer cloned from this consumer instance, since there can be multiple producers.
     pub fn obtain_producer(&self) -> DFQueueProducer<T> {
         DFQueueProducer {
             qref: self.qref.clone(),
@@ -233,6 +261,7 @@ impl<T> DFQueueConsumer<T> {
     
     /// internal function that returns the first non-completed item in the queue (queue is locked already)
     fn peek_locked(&self, locked_queue: MutexGuard<VecDeque<QueuedData<T>>>) -> Option<PeekedData<T>> {
+        
         for e in locked_queue.iter() {
             if e.is_completed() {
                 continue;
@@ -249,14 +278,25 @@ impl<T> DFQueueConsumer<T> {
 
     /// Peeks at the queue in a blocking fashion. 
     /// This will block until it can acquire a lock on the inner queue. 
+    ///
+    /// If no `RemovalPolicy` is given, the default for a locking function is `RemoveNow`.
+    ///
     /// Returns the first non-completed element in the queue without actually removing it from the queue, 
     /// or `None` if the queue is empty. 
     ///
     /// Note: this is NOT IRQ-safe. 
-    /// TODO: use a data guard to automatically release the lock to the returned InnerQueuedData
-    pub fn peek_locking(&self) -> Option<PeekedData<T>> {
+    pub fn peek_locking(&self, policy: Option<RemovalPolicy>) -> Option<PeekedData<T>> {
         // first, acquire the lock so we have exclusive access to the inner queue
-        let innerq = self.qref.queue.lock(); // blocking call
+        let mut innerq = self.qref.queue.lock(); // blocking call
+        
+        // remove completed items from the queue. 
+        // default policy in locking functions should be to remove.
+        match policy {
+            None | Some(RemovalPolicy::RemoveNow) => {
+                remove_completed_items(&mut innerq);
+            }
+            Some(RemovalPolicy::NoRemoval) => { } // do nothing
+        }
         
         self.peek_locked(innerq)
     }
@@ -264,16 +304,28 @@ impl<T> DFQueueConsumer<T> {
 
 
     /// Peeks at the queue in a non-blocking fashion. 
+    ///
+    /// If no `RemovalPolicy` is given, the default for a lockless function is `NoRemoval`.
+    ///
     /// Returns the last non-completed element in the queue without actually removing it from the queue. 
     /// Returns `None` if the lock to the inner queue cannot be obtained, or if the queue is empty.
     ///
     /// Note: this is IRQ-safe. 
-    /// TODO: use a data guard to automatically release the lock to the returned InnerQueuedData
-    pub fn peek_lockless(&self) -> Option<PeekedData<T>> {
+    pub fn peek_lockless(&self, policy: Option<RemovalPolicy>) -> Option<PeekedData<T>> {
         // first, try to acquire the queue lock. 
         let lock_result = self.qref.queue.try_lock();
         match lock_result {
-            Some(innerq) => {
+            Some(mut innerq) => {
+
+                // remove completed items from the queue. 
+                // default policy in lockless functions should be to NOT remove.
+                match policy {
+                    Some(RemovalPolicy::RemoveNow) => {
+                        remove_completed_items(&mut innerq);
+                    }
+                    None | Some(RemovalPolicy::NoRemoval) => { } // do nothing
+                }
+
                 self.peek_locked(innerq)
             },
             None => {
@@ -282,6 +334,12 @@ impl<T> DFQueueConsumer<T> {
         }
     }
 
+
+    #[cfg(test)]
+    fn queue_size(&self) -> usize {
+        let mut innerq = self.qref.queue.lock(); 
+        innerq.len()
+    }
 
 }
 
@@ -326,16 +384,18 @@ impl<T> DFQueueProducer<T> {
     }
 
 
-    /// pushes the given `data` onto the back of the queue.
+    /// Pushes the given `data` onto the back of the queue.
     /// This is a blocking call that will acquire the queue lock, write the data, 
     /// and release the lock before returning to the caller. 
+    ///
+    /// If no `RemovalPolicy` is given, the default for a locking function is `RemoveNow`.
     ///
     /// # Returns 
     /// Returns a QueuedData instance, an Arc-like reference to the given `data` on the queue.
     /// This ensures that the producer can still retain the given `data` if the queue experiences a failure. 
     ///
     /// Note: this is NOT IRQ-safe. 
-    pub fn enqueue_locking(&mut self, data: T) -> QueuedData<T>{
+    pub fn enqueue_locking(&mut self, data: T, policy: Option<RemovalPolicy>) -> QueuedData<T>{
 
         // acquire the lock so we have exclusive access to the inner queue
         let mut innerq = self.qref.queue.lock(); // blocking call
@@ -347,16 +407,25 @@ impl<T> DFQueueProducer<T> {
         let queued_data: QueuedData<T> = QueuedData::new(data);
         innerq.push_back(queued_data.clone()); 
 
-        // TODO: remove items from the innerq that have been completed
+        // remove completed items from the queue. 
+        // default policy in locking functions should be to remove.
+        match policy {
+            None | Some(RemovalPolicy::RemoveNow) => {
+                remove_completed_items(&mut innerq);
+            }
+            Some(RemovalPolicy::NoRemoval) => { } // do nothing
+        }
 
         queued_data
     }
 
 
-    /// pushes the given `data` onto the back of the queue, only if the queue lock can be acquired immediately.
+    /// Pushes the given `data` onto the back of the queue, only if the queue lock can be acquired immediately.
     /// If the queue lock cannot be acquired, then the given `data` is put on a local backlog queue 
     /// that is specific to this `DFQueueProducer`, which will be merged into the actual inner queue
-    /// on the next invocation of any `enqueue` method, provided that the inner queue can be locked immediately at that point. 
+    /// on the next invocation of any `enqueue` method, provided that the inner queue can be locked immediately at that point.
+    ///
+    /// If no `RemovalPolicy` is given, the default for a lockless function is `NoRemoval`.
     ///
     /// # Returns 
     /// Returns a tuple of the form `(QueuedData, bool)` in which:
@@ -373,7 +442,7 @@ impl<T> DFQueueProducer<T> {
     /// 
     ///
     /// Note: this is IRQ-safe. 
-    pub fn enqueue_lockless(&mut self, data: T) -> (QueuedData<T>, bool) {
+    pub fn enqueue_lockless(&mut self, data: T, policy: Option<RemovalPolicy>) -> (QueuedData<T>, bool) {
 
         let queued_data: QueuedData<T> = QueuedData::new(data);
 
@@ -386,7 +455,14 @@ impl<T> DFQueueProducer<T> {
                 innerq.append(&mut self.local_backlog);
                 innerq.push_back(queued_data.clone()); 
 
-                // TODO: remove completed items from the queue
+                // remove completed items from the queue. 
+                // default policy in lockless functions should be to NOT remove.
+                match policy {
+                    Some(RemovalPolicy::RemoveNow) => {
+                        remove_completed_items(&mut innerq);
+                    }
+                    None | Some(RemovalPolicy::NoRemoval) => { } // do nothing
+                }
 
                 (queued_data, true)
             },
@@ -414,8 +490,6 @@ impl<T> DFQueueProducer<T> {
 
 
 }
-
-
 
 
 
@@ -454,11 +528,11 @@ mod test {
 
             for i in 1..20 {
                 for elem in original_data.iter() {
-                    queue_prod.enqueue_lockless(*elem);
+                    queue_prod.enqueue_locking(*elem, None);
                 }
             }
             
-            let (queued_data, backlogged) = queue_prod.enqueue_lockless(256);
+            let (queued_data, backlogged) = queue_prod.enqueue_lockless(256, None);
             println!("prod1: queued_data = {:?}, backlogged?: {}", queued_data, backlogged);
 
             queue_prod.flush_backlog();
@@ -469,11 +543,11 @@ mod test {
 
             for i in 1..20 {
                 for elem in original_data.iter() {
-                    queue_prod2.enqueue_lockless(*elem);
+                    queue_prod2.enqueue_locking(*elem, None);
                 }
             }
 
-            let (queued_data, backlogged) = queue_prod2.enqueue_lockless(512);
+            let (queued_data, backlogged) = queue_prod2.enqueue_lockless(512, None);
             println!("prod2: queued_data = {:?}, backlogged?: {}", queued_data, backlogged);
 
             queue_prod2.flush_backlog();
@@ -481,9 +555,9 @@ mod test {
 
         let mut thr_c = thread::spawn( move || {
             loop {
-                let mut val = queue_cons.peek_locking();
+                let mut val = queue_cons.peek_lockless(Some(RemovalPolicy::RemoveNow));
                 if let Some(v) = val {
-                    println!("peeked: {:?}, value={}", v, *v);
+                    println!("peeked: {:?}, value={}, queue_size: {}", v, *v, queue_cons.queue_size());
                     v.mark_completed();
                 }
                 else {
