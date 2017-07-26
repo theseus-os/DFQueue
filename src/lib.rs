@@ -13,12 +13,12 @@
 //! to see if it is still on the queue or if something has gone wrong and it has failed. 
 //! If a failure has occurred, that producer can enqueue that item again. 
 
-// #![no_std]
+#![no_std]
 
 #![allow(dead_code)]
 #![feature(alloc, collections)]
 
-extern crate core;
+// extern crate core;
 
 extern crate spin;
 extern crate alloc;
