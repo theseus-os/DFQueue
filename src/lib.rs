@@ -101,10 +101,6 @@ pub struct DFQueueConsumer<T> {
     qref: Arc<DFQueue<T>>,
 }
 
-// DFQueueConsumer is Send, but shouldn't be Sync,
-// which from being put in an Arc, since it already contains one internally.
-impl<T: Send> !Sync for DFQueueConsumer<T> { }
-
 impl<T> DFQueueConsumer<T> {
 
     /// Returns a new DFQueueProducer cloned from this consumer instance, since there can be multiple producers.
@@ -132,10 +128,6 @@ impl<T> DFQueueConsumer<T> {
 pub struct DFQueueProducer<T> {
     qref: Arc<DFQueue<T>>,
 }
-
-// DFQueueProducer is Send, but shouldn't be Sync,
-// which from being put in an Arc, since it already contains one internally.
-impl<T: Send> !Sync for DFQueueProducer<T> { }
 
 impl<T> DFQueueProducer<T> {
 
