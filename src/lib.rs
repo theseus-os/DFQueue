@@ -17,7 +17,7 @@
 //! but of course its original position in the queue will be lost. 
 
 
-#![no_std]
+// #![no_std]
 
 #![allow(dead_code)]
 #![feature(alloc, collections)]
@@ -25,12 +25,20 @@
 #![feature(optin_builtin_traits)] // for negative traits
 
 
+// #[cfg(test)]
+// #[macro_use] extern crate std;
 #[cfg(test)]
-#[macro_use] extern crate std;
-
+extern crate time;
+#[cfg(test)]
+extern crate spin;
 
 extern crate alloc;
 extern crate collections;
+
+extern crate core;
+
+
+mod mpsc_queue;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::ptr;
@@ -485,16 +493,22 @@ impl<T> Drop for MpscQueue<T> {
 #[cfg(test)]
 mod test {
     
+
+
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use time::{Duration, PreciseTime};
     
-    use std::sync::mpsc::channel;
-    use std::sync::Arc;
-    use std::thread; 
     use std::vec::Vec;
+    use collections::VecDeque;
     use super::*;
 
+    use spin::Mutex;
 
 
-    #[test]
+
+    // #[test]
     // #[should_panic]
     fn simple_test() {
 
@@ -561,81 +575,335 @@ mod test {
 
 
 
-    #[test]
-    fn mpsc_queue_test() {
-        let nthreads = 16;
-        let top_range = 10;
-        let q = MpscQueue::new();
-        match q.peek() {
-            PeekResult::Empty => {}
-            PeekResult::Inconsistent | PeekResult::Data(..) => panic!()
-        }
+    // #[test]
+    // fn mpsc_queue_test() {
+    //     let nthreads = 16;
+    //     let top_range = 10;
+    //     let q = MpscQueue::new();
+    //     match q.peek() {
+    //         PeekResult::Empty => {}
+    //         PeekResult::Inconsistent | PeekResult::Data(..) => panic!()
+    //     }
         
-        let q = Arc::new(q);
-        let mut threads = vec![];
+    //     let q = Arc::new(q);
+    //     let mut threads = vec![];
 
-        for id in 0..nthreads {
-            let q = q.clone();
-            threads.push(thread::spawn(move|| {
-                for i in 0..top_range {
-                    let push_val = i + (id * top_range);
-                    println!("{}", push_val);
-                    q.push(push_val);
-                    for y in 0..1 {
-                        let mut a = y + 10;
-                        a += 1;
-                    }
+    //     for id in 0..nthreads {
+    //         let q = q.clone();
+    //         threads.push(thread::spawn(move|| {
+    //             for i in 0..top_range {
+    //                 let push_val = i + (id * top_range);
+    //                 println!("{}", push_val);
+    //                 q.push(push_val);
+    //                 for y in 0..1 {
+    //                     let mut a = y + 10;
+    //                     a += 1;
+    //                 }
+    //             }
+    //         }));
+    //     }
+
+    //     for t in threads {
+    //         t.join().unwrap();
+    //     }
+
+    //     // unsafe {
+    //     //     let mut curr = q.tail.load(Ordering::SeqCst);
+    //     //     let curr_node = &*curr;
+    //     //     println!("ail Node: val={:?}, ", curr_node.value);
+    //     //     // if next_node_ptr.is_null() { 
+    //     //     //     print!("next=NULL, ");
+    //     //     // } else { 
+    //     //     //     print!("next={:?}, ", (*next_node_ptr).value);
+    //     //     // }
+
+
+    //     //     while !(*curr).next.load(Ordering::SeqCst).is_null()
+    //     //     {
+    //     //         let curr_node = &*curr;
+    //     //         let next_node_ptr = (*curr).next.load(Ordering::SeqCst);
+
+    //     //         print!("Node: val={:?}, ", curr_node.value);
+    //     //         if next_node_ptr.is_null() { 
+    //     //             print!("next=NULL, ");
+    //     //         } else { 
+    //     //             print!("next={:?}, ", (*next_node_ptr).value);
+    //     //         }
+
+    //     //         curr = (*curr).prev.load(Ordering::SeqCst);
+    //     //     }
+    //     // }
+
+    //     let mut i = 0;
+    //     // while i < nthreads * top_range {
+    //     loop {
+    //         let peeked = q.peek();
+    //         match peeked {
+    //             PeekResult::Empty | PeekResult::Inconsistent => {
+    //                 // println!("peeked data None");
+    //             },
+    //             PeekResult::Data(x) => { 
+    //                 // i += 1;
+    //                 println!("peeked data {}", &*x);
+    //                 x.mark_completed();
+    //             }
+    //         }
+    //     }
+
+    //     println!("done!");
+    // }
+
+
+
+
+    const NUM_ELEMENTS: u64 = 1048576*32; // must be a power of 2 above 32
+    // const NUM_ELEMENTS: u64 = 16; // must be a power of 2 above 32
+    const NUM_TRIALS: u64 = 10;
+
+
+    #[test]
+    fn bench_dfqueue() {
+        println!("========== DFQueue ========== ");
+        
+
+        for i in [1, 2, 4, 8, 16].iter() {
+            let mut results: Vec<u64> = Vec::with_capacity(NUM_TRIALS as usize);
+            for t in 0..NUM_TRIALS {
+                results.push(run_dfqueue(i.clone(), NUM_ELEMENTS).num_nanoseconds().unwrap() as u64);
+            }
+
+
+            results.sort();
+            let median = results[results.len()/2];
+            // let average = results.iter().fold(0, |a, &b| a + b) / NUM_TRIALS;
+            println!("producers={}, elements={}, elapsed={:?}", i, NUM_ELEMENTS, median);
+        }
+    }
+
+
+
+    fn run_dfqueue(producers: u64, elements: u64) -> Duration {
+        // println!("running with producers={}, elements={}", producers, elements);
+
+        let queue: DFQueue<u64> = DFQueue::new();
+        let mut queue_prod = queue.into_producer();
+        let mut queue_cons = queue_prod.get_consumer();
+        let qcons = queue_cons.unwrap();
+
+
+        // start time
+        let start = PreciseTime::now();
+
+        // consumer
+        let consumer_thread = thread::spawn(move|| {
+            
+            let mut total_received = 0;
+            while (total_received < elements) {
+                let mut val = qcons.peek();
+                if let Some(v) = val {
+                    v.mark_completed();
+                    total_received += 1;
                 }
-            }));
+            }        
+        });
+
+        let barrier = Arc::new(Barrier::new(producers as usize));
+        // let mut threads = vec![];
+
+        // producers
+        for _ in 0..producers {
+            let q = queue_prod.obtain_producer();
+            let c = barrier.clone();
+
+            // threads.push(
+            thread::spawn(move|| {
+                c.wait();
+                for i in 0..(elements/producers) {
+                    q.enqueue(i);
+                }
+            });
         }
 
-        for t in threads {
-            t.join().unwrap();
-        }
 
-        // unsafe {
-        //     let mut curr = q.tail.load(Ordering::SeqCst);
-        //     let curr_node = &*curr;
-        //     println!("ail Node: val={:?}, ", curr_node.value);
-        //     // if next_node_ptr.is_null() { 
-        //     //     print!("next=NULL, ");
-        //     // } else { 
-        //     //     print!("next={:?}, ", (*next_node_ptr).value);
-        //     // }
-
-
-        //     while !(*curr).next.load(Ordering::SeqCst).is_null()
-        //     {
-        //         let curr_node = &*curr;
-        //         let next_node_ptr = (*curr).next.load(Ordering::SeqCst);
-
-        //         print!("Node: val={:?}, ", curr_node.value);
-        //         if next_node_ptr.is_null() { 
-        //             print!("next=NULL, ");
-        //         } else { 
-        //             print!("next={:?}, ", (*next_node_ptr).value);
-        //         }
-
-        //         curr = (*curr).prev.load(Ordering::SeqCst);
-        //     }
+        consumer_thread.join();
+        let end = PreciseTime::now(); 
+        
+        // for t in threads {
+        //     t.join().unwrap();
         // }
 
-        let mut i = 0;
-        // while i < nthreads * top_range {
-        loop {
-            let peeked = q.peek();
-            match peeked {
-                PeekResult::Empty | PeekResult::Inconsistent => {
-                    // println!("peeked data None");
-                },
-                PeekResult::Data(x) => { 
-                    // i += 1;
-                    println!("peeked data {}", &*x);
-                    x.mark_completed();
-                }
+        start.to(end)       
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    #[test]
+    fn bench_rust_mutex_queue() {
+        println!("========== Standard Rust Mutex VecDeque queue ========== ");
+
+        for i in [1, 2, 4, 8, 16].iter() {
+            let mut results: Vec<u64> = Vec::with_capacity(NUM_TRIALS as usize);
+            for t in 0..NUM_TRIALS {
+                results.push(run_mpsc_queue(i.clone(), NUM_ELEMENTS).num_nanoseconds().unwrap() as u64);
             }
+
+            results.sort();
+            let median = results[results.len()/2];
+            // let average = results.iter().fold(0, |a, &b| a + b) / NUM_TRIALS;
+            println!("producers={}, elements={}, elapsed={:?}", i, NUM_ELEMENTS, median);
+        }
+    }
+
+
+
+    fn run_mutex_queue(producers: u64, elements: u64) -> Duration {
+        // println!("running with producers={}, elements={}", producers, elements);
+
+        let queue : Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
+        let qref = Arc::new(queue);
+
+        // start time
+        let start = PreciseTime::now();
+
+        // consumer
+        let qcons = qref.clone();
+        let consumer_thread = thread::spawn(move|| {
+            
+            let mut total_received = 0;
+            while (total_received < elements) {
+                match qcons.lock().pop_front() {
+                    Some(_) => { total_received += 1; }
+                    _ => { }
+                }
+            }        
+        });
+
+
+        // let mut threads = vec![];
+        let barrier = Arc::new(Barrier::new(producers as usize));
+
+        // producers
+        for _ in 0..producers {
+            let q = qref.clone();
+            let c = barrier.clone();
+
+            // producer_threads.push(
+            thread::spawn(move|| {
+                c.wait();
+                for i in 0..(elements/producers) {
+                    q.lock().push_back(i);
+                }
+            });
+            // );
         }
 
-        println!("done!");
+        // for t in threads {
+        //     t.join().unwrap();
+        // }
+
+        consumer_thread.join();
+        let end = PreciseTime::now(); 
+        
+        start.to(end)       
+    }
+
+
+
+
+
+
+
+
+    use super::mpsc_queue::{Queue, Data, Empty, PopResult, Inconsistent};
+
+
+
+
+    #[test]
+    fn bench_rust_mpsc_queue() {
+        println!("========== Standard Rust MPSC lockless queue ========== ");
+
+        for i in [1, 2, 4, 8, 16].iter() {
+            let mut results: Vec<u64> = Vec::with_capacity(NUM_TRIALS as usize);
+            for t in 0..NUM_TRIALS {
+                results.push(run_mpsc_queue(i.clone(), NUM_ELEMENTS).num_nanoseconds().unwrap() as u64);
+            }
+
+            results.sort();
+            let median = results[results.len()/2];
+            // let average = results.iter().fold(0, |a, &b| a + b) / NUM_TRIALS;
+            println!("producers={}, elements={}, elapsed={:?}", i, NUM_ELEMENTS, median);
+        }
+    }
+
+
+
+    fn run_mpsc_queue(producers: u64, elements: u64) -> Duration {
+        // println!("running with producers={}, elements={}", producers, elements);
+
+        let queue = Queue::new();
+        let qref = Arc::new(queue);
+
+        // start time
+        let start = PreciseTime::now();
+
+        // consumer
+        let qcons = qref.clone();
+        let consumer_thread = thread::spawn(move|| {
+            
+            let mut total_received = 0;
+            while (total_received < elements) {
+                match qcons.pop() {
+                    PopResult::Data(_) => { total_received += 1}
+                    _ => { }
+                }
+            }        
+        });
+
+
+        // let mut threads = vec![];
+        let barrier = Arc::new(Barrier::new(producers as usize));
+
+        // producers
+        for _ in 0..producers {
+            let q = qref.clone();
+            let c = barrier.clone();
+
+            // producer_threads.push(
+            thread::spawn(move|| {
+                c.wait();
+                for i in 0..(elements/producers) {
+                    q.push(i);
+                }
+            });
+            // );
+        }
+
+        // for t in threads {
+        //     t.join().unwrap();
+        // }
+
+        consumer_thread.join();
+        let end = PreciseTime::now(); 
+        
+        start.to(end)       
     }
 }
