@@ -20,7 +20,7 @@
 #![no_std]
 
 #![allow(dead_code)]
-#![feature(alloc, collections)]
+#![feature(alloc)]
 #![feature(box_syntax)]
 #![feature(optin_builtin_traits)] // for negative traits
 
@@ -30,7 +30,6 @@
 
 
 extern crate alloc;
-extern crate collections;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::ptr;
