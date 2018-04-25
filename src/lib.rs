@@ -37,6 +37,7 @@ use core::ops::Deref;
 use alloc::arc::Arc;
 
 
+pub mod mpsc_queue;
 
 
 
@@ -45,7 +46,7 @@ use alloc::arc::Arc;
 #[derive(Debug)]
 pub struct DFQueue<T> {
     /// the actual inner queue
-    queue: MpscQueue<T>,
+    queue: InnerQueue<T>,
     /// whether this queue has a consumer (it can only have one!!)
     has_consumer: AtomicBool,
 }
@@ -58,7 +59,7 @@ impl<T> DFQueue<T> {
     /// using the functions `into_consumer()` or `obtain_producer()`.
     pub fn new() -> DFQueue<T> {
         DFQueue {
-            queue: MpscQueue::new(),
+            queue: InnerQueue::new(),
             has_consumer: AtomicBool::default(),
         }
     }
@@ -321,14 +322,12 @@ struct InnerQueuedData<T> {
 }
 
 
-/// The multi-producer single-consumer structure. This is not cloneable, but it
-/// may be safely shared so long as it is guaranteed that there is only one
-/// popper at a time (many pushers are allowed).
-/// Borrowed from the Rust libstd's mpsc_queue, but modified slightly.
+/// Adapted from Rust's `std::sync::mpsc::Queue`, 
+/// but modified slightly to forbid pop() in favor of peek().
 /// Therefore, we assume it's safe. We also preserve safety by 
 /// always checking for null pointers before dereferencing.
 #[derive(Debug)]
-struct MpscQueue<T> {
+struct InnerQueue<T> {
     /// The head is the node that was most recently pushed
     head: AtomicPtr<Node<T>>,
     /// the tail is a placeholder that exists right after the one that was pushed first.
@@ -336,8 +335,8 @@ struct MpscQueue<T> {
     tail: UnsafeCell<*mut Node<T>>,
 }
 
-unsafe impl<T: Send> Send for MpscQueue<T> { }
-unsafe impl<T: Send> Sync for MpscQueue<T> { }
+unsafe impl<T: Send> Send for InnerQueue<T> { }
+unsafe impl<T: Send> Sync for InnerQueue<T> { }
 
 impl<T> Node<T> {
     unsafe fn new(v: Option<QueuedData<T>>) -> *mut Node<T> {
@@ -349,12 +348,12 @@ impl<T> Node<T> {
     }
 }
 
-impl<T> MpscQueue<T> {
+impl<T> InnerQueue<T> {
     /// Creates a new queue that is safe to share among multiple producers and one consumer. 
     /// Its storage semantics are push onto the front, pop off the back. 
-    fn new() -> MpscQueue<T> {
+    fn new() -> InnerQueue<T> {
         let stub = unsafe { Node::new(None) };
-        MpscQueue {
+        InnerQueue {
             head: AtomicPtr::new(stub),
             tail: UnsafeCell::new(stub),
         }
@@ -374,38 +373,6 @@ impl<T> MpscQueue<T> {
 
         queued_data
     }
-
-
-    // We don't permit popping from the DFQueue, so this is currently disabled. 
-    // It's also disabled becausing using both peek() and pop() do not play well together,
-    // because pop() has no understanding of whether a node is completed. 
-    // /// Pops some data from the back of the queue. 
-    // ///
-    // /// Note that the current implementation means that this function cannot
-    // /// return `Option<T>`. It is possible for this queue to be in an
-    // /// inconsistent state where many pushes have succeeded and completely
-    // /// finished, but pops cannot return `Some(t)`. This inconsistent state
-    // /// happens when a pusher is pre-empted at an inopportune moment.
-    // ///
-    // /// This inconsistent state means that this queue does indeed have data, but
-    // /// it does not currently have access to it at this time.
-    // fn pop(&self) -> PopResult<T> {
-    //     unsafe {
-    //         let tail = *self.tail.get();
-    //         let next = (*tail).next.load(Ordering::Acquire);
-
-    //         if !next.is_null() {
-    //             *self.tail.get() = next;
-    //             assert!((*tail).value.is_none());
-    //             assert!((*next).value.is_some());
-    //             let ret = (*next).value.take().unwrap();
-    //             let _: Box<Node<T>> = Box::from_raw(tail);
-    //             return PopResult::Data(ret);
-    //         }
-
-    //         if self.head.load(Ordering::Acquire) == tail {PopResult::Empty} else {PopResult::Inconsistent}
-    //     }
-    // }
 
 
     /// Peeks at this queue and returns a reference to the next non-completed item.
@@ -453,7 +420,7 @@ impl<T> MpscQueue<T> {
     }
 }
 
-impl<T> Drop for MpscQueue<T> {
+impl<T> Drop for InnerQueue<T> {
     fn drop(&mut self) {
         unsafe {
             let mut cur = *self.tail.get();
@@ -465,16 +432,6 @@ impl<T> Drop for MpscQueue<T> {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -561,10 +518,10 @@ mod test {
 
 
     #[test]
-    fn mpsc_queue_test() {
+    fn inner_queue_test() {
         let nthreads = 16;
         let top_range = 10;
-        let q = MpscQueue::new();
+        let q = InnerQueue::new();
         match q.peek() {
             PeekResult::Empty => {}
             PeekResult::Inconsistent | PeekResult::Data(..) => panic!()
@@ -631,6 +588,87 @@ mod test {
                     // i += 1;
                     println!("peeked data {}", &*x);
                     x.mark_completed();
+                }
+            }
+        }
+
+        println!("done!");
+    }
+
+
+
+    #[test]
+    fn mpsc_queue_test() {
+        use super::mpsc_queue::{MpscQueue, PopResult};
+
+        let nthreads = 16;
+        let top_range = 1000;
+        let q = MpscQueue::new();
+        match q.pop() {
+            PopResult::Empty => { } //ok
+            PopResult::Data(_) | PopResult::Inconsistent => { panic!("empty queue had Data or was Inconsistent"); }
+        }
+        
+        let q = Arc::new(q);
+        let mut threads = vec![];
+
+        for id in 0..nthreads {
+            let q = q.clone();
+            threads.push(thread::spawn(move|| {
+                for i in 0..top_range {
+                    let push_val = i + (id * top_range);
+                    println!("{}", push_val);
+                    q.push(push_val);
+                    for y in 0..1 {
+                        let mut a = y + 10;
+                        a += 1;
+                    }
+                }
+            }));
+        }
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // unsafe {
+        //     let mut curr = q.tail.load(Ordering::SeqCst);
+        //     let curr_node = &*curr;
+        //     println!("ail Node: val={:?}, ", curr_node.value);
+        //     // if next_node_ptr.is_null() { 
+        //     //     print!("next=NULL, ");
+        //     // } else { 
+        //     //     print!("next={:?}, ", (*next_node_ptr).value);
+        //     // }
+
+
+        //     while !(*curr).next.load(Ordering::SeqCst).is_null()
+        //     {
+        //         let curr_node = &*curr;
+        //         let next_node_ptr = (*curr).next.load(Ordering::SeqCst);
+
+        //         print!("Node: val={:?}, ", curr_node.value);
+        //         if next_node_ptr.is_null() { 
+        //             print!("next=NULL, ");
+        //         } else { 
+        //             print!("next={:?}, ", (*next_node_ptr).value);
+        //         }
+
+        //         curr = (*curr).prev.load(Ordering::SeqCst);
+        //     }
+        // }
+
+        let mut i = 0;
+        // while i < nthreads * top_range {
+        loop {
+            let popped = q.pop();
+            match popped {
+                PopResult::Empty | PopResult::Inconsistent => {
+                    // println!("popped data None");
+                },
+                PopResult::Data(x) => { 
+                    // i += 1;
+                    println!("popped data {}", x);
                 }
             }
         }
