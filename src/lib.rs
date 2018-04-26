@@ -602,12 +602,9 @@ mod test {
         use super::mpsc_queue::{MpscQueue, PopResult};
 
         let nthreads = 16;
-        let top_range = 1000;
+        let top_range = 100;
         let q = MpscQueue::new();
-        match q.pop() {
-            PopResult::Empty => { } //ok
-            PopResult::Data(_) | PopResult::Inconsistent => { panic!("empty queue had Data or was Inconsistent"); }
-        }
+        assert!(q.pop().is_none());
         
         let q = Arc::new(q);
         let mut threads = vec![];
@@ -663,10 +660,10 @@ mod test {
         loop {
             let popped = q.pop();
             match popped {
-                PopResult::Empty | PopResult::Inconsistent => {
+                None => {
                     // println!("popped data None");
                 },
-                PopResult::Data(x) => { 
+                Some(x) => { 
                     // i += 1;
                     println!("popped data {}", x);
                 }

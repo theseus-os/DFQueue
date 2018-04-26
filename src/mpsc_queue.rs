@@ -75,7 +75,7 @@ impl<T> MpscQueue<T> {
     ///
     /// This inconsistent state means that this queue does indeed have data, but
     /// it does not currently have access to it at this time.
-    pub fn pop(&self) -> PopResult<T> {
+    fn pop_inner(&self) -> PopResult<T> {
         unsafe {
             let tail = *self.tail.get();
             let next = (*tail).next.load(Ordering::Acquire);
@@ -90,6 +90,14 @@ impl<T> MpscQueue<T> {
             }
 
             if self.head.load(Ordering::Acquire) == tail { PopResult::Empty } else { PopResult::Inconsistent }
+        }
+    }
+
+    /// Pops data from this queue.
+    pub fn pop(&self) -> Option<T> {
+        match self.pop_inner() {
+            PopResult::Data(d) => Some(d),
+            _ => None,
         }
     }
 }
