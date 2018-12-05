@@ -34,7 +34,7 @@ extern crate alloc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::ptr;
 use core::ops::Deref;
-use alloc::arc::Arc;
+use alloc::sync::Arc;
 
 
 pub mod mpsc_queue;

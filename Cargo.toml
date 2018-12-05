@@ -11,6 +11,6 @@ readme = "README.md"
 description = "DFQ is a decoupled, fault-tolerant MPSC queue. DFQ is compatible with `no_std` and is interrupt-safe by being entirely lock-free and mostly wait-free."
 
 [dependencies]
-atomic = "0.3.4"
-spin = "0.4.5"
+atomic = "0.4.0"
+spin = "0.4.10"
 
