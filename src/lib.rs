@@ -20,7 +20,6 @@
 #![no_std]
 
 #![allow(dead_code)]
-#![feature(alloc)]
 #![feature(box_syntax)]
 #![feature(optin_builtin_traits)] // for negative traits
 
