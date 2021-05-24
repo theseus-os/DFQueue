@@ -21,7 +21,6 @@
 
 #![allow(dead_code)]
 #![feature(box_syntax)]
-#![feature(optin_builtin_traits)] // for negative traits
 
 
 #[cfg(test)]

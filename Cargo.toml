@@ -5,11 +5,8 @@ version = "0.1.0"
 keywords = ["queue", "no_std", "fault tolerant", "decoupled", "interrupt", "irq-safe"]
 categories = ["no-std", "abstractions", "algorithms"]
 license = "MIT"
-repository = "https://github.com/kevinaboos/DFQueue"
+repository = "https://github.com/theseus-os/DFQueue"
 readme = "README.md"
 
 description = "DFQ is a decoupled, fault-tolerant MPSC queue. DFQ is compatible with `no_std` and is interrupt-safe by being entirely lock-free and mostly wait-free."
-
-[dependencies]
-spin = "0.4.10"
 
