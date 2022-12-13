@@ -3,7 +3,7 @@
 //!
 //! DFQ accepts immutable data items only and does not allow the consumer
 //! to immediately remove (pop) or modify the items in the queue.
-//! In a transactional fashion, the consumer must call [`mark_completed`]: #method.mark_completed 
+//! In a transactional fashion, the consumer must call [`mark_completed`]
 //! on a queued item to indicate that that item can be safely removed from the queue. 
 //! Because the original producer that enqueued that item retains a reference to that item,
 //! it is then safe for any entity (any producer or the consumer) to remove it from the queue. 
@@ -15,6 +15,8 @@
 //! to see if it is still on the queue or if something has gone wrong and it has failed. 
 //! If a failure has occurred, that producer can enqueue that item again, 
 //! but of course its original position in the queue will be lost. 
+//!
+//! [`mark_completed`]: PeekedData::mark_completed
 
 
 #![no_std]
