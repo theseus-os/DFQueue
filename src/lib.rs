@@ -22,8 +22,6 @@
 #![no_std]
 
 #![allow(dead_code)]
-#![feature(box_syntax)]
-
 
 #[cfg(test)]
 #[macro_use] extern crate std;
@@ -340,11 +338,11 @@ unsafe impl<T: Send> Sync for InnerQueue<T> { }
 
 impl<T> Node<T> {
     unsafe fn new(v: Option<QueuedData<T>>) -> *mut Node<T> {
-        Box::into_raw(box Node {
+        Box::into_raw(Box::new(Node {
             next: AtomicPtr::new(ptr::null_mut()),
             // prev: AtomicPtr::new(ptr::null_mut()), // we don't need prev
             value: v,
-        })
+        }))
     }
 }
 
